@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 .env
 *.log
+data/browser/
+data/screenshots/
+data/*.key
+data/credentials.key

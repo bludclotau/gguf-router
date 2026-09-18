@@ -5,12 +5,15 @@ from typing import Any, Optional
 import json
 import yaml
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 import db
+from agent_loop import run_bounded_agent
 from cleaner import clean_output
 from persona_engine import apply
+from tools import browser as browser_tools
 from tools.registry import run_tool
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -34,6 +37,7 @@ COOLDOWN_SECONDS = 2
 async def lifespan(_app: FastAPI):
     db.init_schema()
     yield
+    browser_tools.shutdown()
 
 
 app = FastAPI(title="gguf-router", lifespan=lifespan)
@@ -50,6 +54,7 @@ class RouteRequest(BaseModel):
     n_predict: Optional[int] = Field(default=256)
     max_tokens: Optional[int] = None
     stream: bool = False
+    agent: bool = False
 
 
 def select_model(persona: Optional[str], task: Optional[str]) -> str:
@@ -96,6 +101,35 @@ def health() -> dict[str, Any]:
     return {"status": "router-ok"}
 
 
+@app.get("/debug/login", response_class=HTMLResponse)
+def debug_login():
+    """Local login fixture for auto-login tests. Not a public product surface."""
+    return """<!doctype html><html><head><title>Log in</title></head><body>
+    <h1>Log in</h1>
+    <form method="get" action="/debug/login/go">
+      <input name="username" type="text">
+      <input name="password" type="password">
+      <button type="submit">Log in</button>
+    </form>
+    </body></html>"""
+
+
+@app.get("/debug/login/go")
+def debug_login_go(username: str = "", password: str = ""):
+    if username == "wendy" and password == "snacktime":
+        resp = RedirectResponse("/debug/secret", status_code=303)
+        resp.set_cookie("fixture_auth", "wendy", httponly=True)
+        return resp
+    return HTMLResponse("<html><title>Log in</title><p>bad credentials</p></html>", status_code=401)
+
+
+@app.get("/debug/secret", response_class=HTMLResponse)
+def debug_secret(request: Request):
+    if request.cookies.get("fixture_auth") != "wendy":
+        return RedirectResponse("/debug/login", status_code=303)
+    return "<html><title>Secret</title><h1>SECRET waffle-iron-42</h1></html>"
+
+
 @app.post("/tool")
 def tool(payload: dict) -> Any:
     name = payload.get("tool")
@@ -103,10 +137,23 @@ def tool(payload: dict) -> Any:
     user_id = payload.get("user_id", "unknown")
     bot_name = payload.get("bot_name", "discord")
 
-    result = run_tool(name, args)
+    agent_name = payload.get("persona") or bot_name
+    result = run_tool(name, args, bot_name=agent_name, user_id=user_id)
     db.async_write(db.save_raw_output, f"tool:{user_id}:{name}", str(result))
     db.log_tool(user_id, name, str(result))
-    return {"result": result, "user_id": user_id, "bot_name": bot_name}
+    db.log_agent_event(
+        agent_name,
+        name or "tool",
+        {"user_id": user_id, "status": (result or {}).get("status") if isinstance(result, dict) else "ok"},
+    )
+    db.touch_session_from_tool(agent_name, result)
+    if isinstance(result, dict) and result.get("status") == "blocked":
+        db.maybe_consolidate(agent_name, user_id=user_id, force=True)
+        result = dict(result)
+        result.setdefault("message", result.get("message"))
+    else:
+        db.maybe_consolidate(agent_name, user_id=user_id, force=False)
+    return {"result": result, "user_id": user_id, "bot_name": bot_name, "agent": agent_name}
 
 
 @app.post("/route")
@@ -123,16 +170,21 @@ def route(payload: RouteRequest) -> Any:
     tool_name = payload.tool
     tool_result = None
     if tool_name:
-        tool_result = run_tool(tool_name, payload.args or {})
+        tool_result = run_tool(tool_name, payload.args or {}, bot_name=bot_name, user_id=user_id)
         db.async_write(db.save_raw_output, f"tool:{user_id}:{tool_name}", str(tool_result))
         db.log_tool(user_id, tool_name, str(tool_result))
+        db.log_agent_event(
+            persona or bot_name,
+            tool_name,
+            {"user_id": user_id, "status": (tool_result or {}).get("status") if isinstance(tool_result, dict) else "ok"},
+        )
 
     final_prompt, model = apply(
         persona,
         task,
         prompt,
         user_id,
-        tool=tool_name,
+        tool=tool_name or ("browser" if payload.agent else None),
         tool_result=tool_result,
     )
     endpoint = MODELS.get(model, MODELS["qwen"])
@@ -147,6 +199,39 @@ def route(payload: RouteRequest) -> Any:
     n_predict = payload.n_predict if payload.n_predict is not None else payload.max_tokens
     if n_predict is None:
         n_predict = 256
+
+    if payload.agent:
+        outcome = run_bounded_agent(
+            prompt=prompt,
+            persona=persona,
+            task=task,
+            user_id=user_id,
+            bot_name=bot_name,
+            endpoint=endpoint,
+            n_predict=n_predict,
+        )
+        clean = outcome["clean"]
+        raw = outcome["raw"]
+        db.async_write(db.save_raw_output, f"raw:{user_id}", raw)
+        db.async_write(db.update_conversation, user_id, bot_name, persona, task, clean)
+        db.set_cooldown(user_id, COOLDOWN_SECONDS)
+        return {
+            "clean": clean,
+            "raw": raw,
+            "content": clean,
+            "reply": clean,
+            "model": model,
+            "persona": persona,
+            "task": task,
+            "user_id": user_id,
+            "bot_name": bot_name,
+            "agent": outcome.get("agent"),
+            "stopped": outcome.get("stopped"),
+            "blocked": bool(outcome.get("blocked")),
+            "blocked_reason": outcome.get("blocked_reason"),
+            "planner": outcome.get("planner"),
+            "steps": outcome.get("steps"),
+        }
 
     try:
         r = requests.post(

@@ -18,4 +18,28 @@ Bot endpoint: `http://localhost:9000/route`.
 
 Tool harness: `POST /tool` with `{"tool":"web_fetch","args":{"url":"https://example.com"},"user_id":"...","bot_name":"..."}`. Discord: `@bot !web <url>`.
 
+### Bounded agents (browser + memory)
+
+This is a chat-scoped agent, not an open-ended crawler: **6 tool steps** and **60s wall clock** per `/route` with `"agent": true`. The planner is a **GBNF-constrained** llama.cpp call (`grammar/tool_call.gbnf`) so Dolphin/Qwen emit valid `{"tool":...}` or `{"reply":...}` instead of hoping they format JSON. A URL in the prompt forces a tool-only grammar on the first step; after a successful read, a reply-only grammar stops tool-churn. Login walls call `browser_login` using the `credentials` table (secrets never enter the prompt). Fixture: `http://127.0.0.1:9000/debug/login` (wendy / snacktime).
+
+Stateful Playwright keeps **one Chromium context per persona**. Cookies go to `data/browser/<persona>.json` and `tools.tool_state`. CAPTCHA / Cloudflare / login walls return `{"status":"blocked","reason":...}` instead of pretending the page loaded.
+
+Memory split (all in `agent_cluster`):
+
+- `sessions.context` — short-term scratch (current URL, last read, last 6 turns). Trimmed on write.
+- `events` — append-only audit (`event_type`, `payload`). Live columns, not the older `type`/`data` names.
+- `memories` — durable notes. After a loop (or every 8 events) recent events are folded into an extractive note. No second LLM pass; the local model is already the bottleneck.
+
+Discord: `@bot !browse <url> [instruction]` runs the agent loop. Replies ack immediately (`On it…`) then edit when the loop finishes.
+
+```bash
+curl -X POST http://localhost:9000/tool \
+  -H 'Content-Type: application/json' \
+  -d '{"tool":"browser_goto","args":{"url":"https://example.com"},"bot_name":"wendy"}'
+
+curl -X POST http://localhost:9000/route \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"open https://example.com and tell me the heading","persona":"wendy","bot_name":"wendy","user_id":"1","agent":true}'
+```
+
 Service: `systemctl --user status gguf-router` (system unit is installed at `/etc/systemd/system/gguf-router.service`; enable/start of that unit needs a sudo password).

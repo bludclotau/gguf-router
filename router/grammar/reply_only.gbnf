@@ -1,0 +1,3 @@
+root ::= "{" ws "\"reply\"" ws ":" ws string ws "}"
+string ::= "\"" [^"\n]* "\""
+ws ::= [ \t\n]*
