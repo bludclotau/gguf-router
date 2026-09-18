@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 import db
 from cleaner import clean_output
 from persona_engine import apply
+from tools.registry import run_tool
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -44,6 +45,8 @@ class RouteRequest(BaseModel):
     task: Optional[str] = None
     user_id: Optional[str] = "unknown"
     bot_name: Optional[str] = "discord"
+    tool: Optional[str] = None
+    args: Optional[dict] = None
     n_predict: Optional[int] = Field(default=256)
     max_tokens: Optional[int] = None
     stream: bool = False
@@ -93,6 +96,19 @@ def health() -> dict[str, Any]:
     return {"status": "router-ok"}
 
 
+@app.post("/tool")
+def tool(payload: dict) -> Any:
+    name = payload.get("tool")
+    args = payload.get("args", {}) or {}
+    user_id = payload.get("user_id", "unknown")
+    bot_name = payload.get("bot_name", "discord")
+
+    result = run_tool(name, args)
+    db.async_write(db.save_raw_output, f"tool:{user_id}:{name}", str(result))
+    db.log_tool(user_id, name, str(result))
+    return {"result": result, "user_id": user_id, "bot_name": bot_name}
+
+
 @app.post("/route")
 def route(payload: RouteRequest) -> Any:
     prompt = payload.prompt
@@ -104,7 +120,21 @@ def route(payload: RouteRequest) -> Any:
     if db.check_cooldown(user_id):
         return {"clean": "Cooldown active.", "raw": None}
 
-    final_prompt, model = apply(persona, task, prompt, user_id)
+    tool_name = payload.tool
+    tool_result = None
+    if tool_name:
+        tool_result = run_tool(tool_name, payload.args or {})
+        db.async_write(db.save_raw_output, f"tool:{user_id}:{tool_name}", str(tool_result))
+        db.log_tool(user_id, tool_name, str(tool_result))
+
+    final_prompt, model = apply(
+        persona,
+        task,
+        prompt,
+        user_id,
+        tool=tool_name,
+        tool_result=tool_result,
+    )
     endpoint = MODELS.get(model, MODELS["qwen"])
 
     if model == "qwen":

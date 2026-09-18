@@ -16,4 +16,6 @@ Copy `.env.example` to `.env` and set `DATABASE_URL`. Schema lives in `sql/schem
 
 Bot endpoint: `http://localhost:9000/route`.
 
+Tool harness: `POST /tool` with `{"tool":"web_fetch","args":{"url":"https://example.com"},"user_id":"...","bot_name":"..."}`. Discord: `@bot !web <url>`.
+
 Service: `systemctl --user status gguf-router` (system unit is installed at `/etc/systemd/system/gguf-router.service`; enable/start of that unit needs a sudo password).

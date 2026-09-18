@@ -12,6 +12,10 @@ _write_lock = threading.Lock()
 def async_write(func, *args):
     threading.Thread(target=func, args=args, daemon=True).start()
 
+
+def log_tool(user_id, tool_name, output):
+    async_write(save_raw_output, f"tool:{user_id}:{tool_name}", str(output))
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS conversations (
     id SERIAL PRIMARY KEY,
