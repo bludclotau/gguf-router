@@ -25,7 +25,7 @@ with open(BASE_DIR / "tasks.json", encoding="utf-8") as fh:
 
 MODELS = CONFIG["models"]
 DEFAULT_MODEL = "qwen"
-REQUEST_TIMEOUT_S = 240
+REQUEST_TIMEOUT_S = 120
 COOLDOWN_SECONDS = 2
 
 
@@ -90,13 +90,7 @@ def extract_raw_text(payload: Any) -> str:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {
-        "status": "ok",
-        "models": list(MODELS.keys()),
-        "personas": PERSONAS,
-        "tasks": TASKS,
-        "postgres": True,
-    }
+    return {"status": "router-ok"}
 
 
 @app.post("/route")
@@ -113,6 +107,13 @@ def route(payload: RouteRequest) -> Any:
     final_prompt, model = apply(persona, task, prompt, user_id)
     endpoint = MODELS.get(model, MODELS["qwen"])
 
+    if model == "qwen":
+        try:
+            requests.get("http://10.1.1.122:8081/health", timeout=2)
+        except Exception:
+            model = "dolphin"
+            endpoint = MODELS["dolphin"]
+
     n_predict = payload.n_predict if payload.n_predict is not None else payload.max_tokens
     if n_predict is None:
         n_predict = 256
@@ -121,7 +122,7 @@ def route(payload: RouteRequest) -> Any:
         r = requests.post(
             endpoint,
             json={"prompt": final_prompt, "n_predict": n_predict},
-            timeout=REQUEST_TIMEOUT_S,
+            timeout=120,
         )
         r.raise_for_status()
         raw = r.json().get("content", "")
@@ -130,9 +131,9 @@ def route(payload: RouteRequest) -> Any:
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=f"{model} returned non-JSON") from exc
 
-    db.save_raw_output(f"raw:{user_id}", raw)
+    db.async_write(db.save_raw_output, f"raw:{user_id}", raw)
     clean = clean_output(raw)
-    db.update_conversation(user_id, bot_name, persona, task, clean)
+    db.async_write(db.update_conversation, user_id, bot_name, persona, task, clean)
     db.set_cooldown(user_id, COOLDOWN_SECONDS)
 
     return {

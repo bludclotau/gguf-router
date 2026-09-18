@@ -1,9 +1,16 @@
 import os
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
+
+_write_lock = threading.Lock()
+
+
+def async_write(func, *args):
+    threading.Thread(target=func, args=args, daemon=True).start()
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -81,17 +88,25 @@ def _cursor(dict_cursor=False):
     return conn.cursor(cursor_factory=factory) if factory else conn.cursor()
 
 
+def _run_write(sql, params):
+    with _write_lock:
+        cur = _cursor()
+        cur.execute(sql, params)
+        conn.commit()
+        cur.close()
+
+
 def init_schema() -> bool:
-    cur = _cursor()
-    cur.execute(SCHEMA_SQL)
-    conn.commit()
-    cur.close()
+    with _write_lock:
+        cur = _cursor()
+        cur.execute(SCHEMA_SQL)
+        conn.commit()
+        cur.close()
     return True
 
 
 def save_raw_output(key, value):
-    cur = _cursor()
-    cur.execute(
+    _run_write(
         """
         INSERT INTO cache (key, value, expires_at)
         VALUES (%s, %s, %s)
@@ -100,15 +115,14 @@ def save_raw_output(key, value):
         """,
         (key, value, datetime.now() + timedelta(minutes=10)),
     )
-    conn.commit()
-    cur.close()
 
 
 def get_cached(key):
-    cur = _cursor(dict_cursor=True)
-    cur.execute("SELECT value, expires_at FROM cache WHERE key = %s", (key,))
-    row = cur.fetchone()
-    cur.close()
+    with _write_lock:
+        cur = _cursor(dict_cursor=True)
+        cur.execute("SELECT value, expires_at FROM cache WHERE key = %s", (key,))
+        row = cur.fetchone()
+        cur.close()
     if not row:
         return None
     expires_at = row["expires_at"]
@@ -120,8 +134,7 @@ def get_cached(key):
 
 
 def set_cooldown(user_id, seconds):
-    cur = _cursor()
-    cur.execute(
+    _run_write(
         """
         INSERT INTO cache (key, value, expires_at)
         VALUES (%s, %s, %s)
@@ -130,8 +143,6 @@ def set_cooldown(user_id, seconds):
         """,
         (f"cooldown:{user_id}", "1", datetime.now() + timedelta(seconds=seconds)),
     )
-    conn.commit()
-    cur.close()
 
 
 def check_cooldown(user_id):
@@ -139,30 +150,28 @@ def check_cooldown(user_id):
 
 
 def update_conversation(user_id, bot_name, persona, task, last_message):
-    cur = _cursor()
-    cur.execute(
+    _run_write(
         """
         INSERT INTO conversations (user_id, bot_name, persona, task, last_message)
         VALUES (%s, %s, %s, %s, %s)
         """,
         (user_id, bot_name, persona, task, last_message),
     )
-    conn.commit()
-    cur.close()
 
 
 def get_persona_memory(user_id, persona):
-    cur = _cursor(dict_cursor=True)
-    cur.execute(
-        """
-        SELECT last_message FROM conversations
-        WHERE user_id = %s AND persona = %s
-        ORDER BY updated_at DESC LIMIT 1
-        """,
-        (user_id, persona),
-    )
-    row = cur.fetchone()
-    cur.close()
+    with _write_lock:
+        cur = _cursor(dict_cursor=True)
+        cur.execute(
+            """
+            SELECT last_message FROM conversations
+            WHERE user_id = %s AND persona = %s
+            ORDER BY updated_at DESC LIMIT 1
+            """,
+            (user_id, persona),
+        )
+        row = cur.fetchone()
+        cur.close()
     return row["last_message"] if row else None
 
 
@@ -176,17 +185,18 @@ def get_last_message(user_id=None, bot_name=None):
         clauses.append("bot_name = %s")
         params.append(bot_name)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    cur = _cursor(dict_cursor=True)
-    cur.execute(
-        f"""
-        SELECT user_id, bot_name, persona, task, last_message, updated_at
-        FROM conversations
-        {where}
-        ORDER BY updated_at DESC, id DESC
-        LIMIT 1
-        """,
-        params,
-    )
-    row = cur.fetchone()
-    cur.close()
+    with _write_lock:
+        cur = _cursor(dict_cursor=True)
+        cur.execute(
+            f"""
+            SELECT user_id, bot_name, persona, task, last_message, updated_at
+            FROM conversations
+            {where}
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            params,
+        )
+        row = cur.fetchone()
+        cur.close()
     return dict(row) if row else None
