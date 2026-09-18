@@ -25,6 +25,7 @@ with open(BASE_DIR / "tasks.json", encoding="utf-8") as fh:
 MODELS = CONFIG["models"]
 DEFAULT_MODEL = "qwen"
 REQUEST_TIMEOUT_S = 240
+COOLDOWN_SECONDS = 2
 
 
 @asynccontextmanager
@@ -40,6 +41,8 @@ class RouteRequest(BaseModel):
     prompt: str
     persona: Optional[str] = None
     task: Optional[str] = None
+    user_id: Optional[str] = "unknown"
+    bot_name: Optional[str] = "discord"
     n_predict: Optional[int] = Field(default=256)
     max_tokens: Optional[int] = None
     stream: bool = False
@@ -50,10 +53,14 @@ def select_model(persona: Optional[str], task: Optional[str]) -> str:
         mapped = PERSONAS.get(persona) or PERSONAS.get(persona.lower())
         if mapped:
             return mapped
+        if persona in MODELS or (persona and persona.lower() in MODELS):
+            return persona if persona in MODELS else persona.lower()
     if task:
         mapped = TASKS.get(task) or TASKS.get(task.lower())
         if mapped:
             return mapped
+        if task in MODELS or (task and task.lower() in MODELS):
+            return task if task in MODELS else task.lower()
     return DEFAULT_MODEL
 
 
@@ -87,29 +94,34 @@ def health() -> dict[str, Any]:
         "models": list(MODELS.keys()),
         "personas": PERSONAS,
         "tasks": TASKS,
-        "postgres": bool(db.DSN),
+        "postgres": True,
     }
 
 
 @app.post("/route")
-def route(body: RouteRequest) -> Any:
-    model_name = select_model(body.persona, body.task)
-    endpoint = MODELS.get(model_name)
-    if not endpoint:
-        raise HTTPException(status_code=500, detail=f"No endpoint configured for model '{model_name}'")
+def route(payload: RouteRequest) -> Any:
+    prompt = payload.prompt
+    persona = payload.persona
+    task = payload.task
+    user_id = payload.user_id or "unknown"
+    bot_name = payload.bot_name or "discord"
 
-    n_predict = body.n_predict if body.n_predict is not None else body.max_tokens
+    if db.check_cooldown(user_id):
+        return {"clean": "Cooldown active.", "raw": None}
+
+    model_name = select_model(persona, task)
+    endpoint = MODELS.get(model_name, MODELS[DEFAULT_MODEL])
+
+    n_predict = payload.n_predict if payload.n_predict is not None else payload.max_tokens
     if n_predict is None:
         n_predict = 256
 
-    payload = {
-        "prompt": body.prompt,
-        "n_predict": n_predict,
-        "stream": False,
-    }
-
     try:
-        response = requests.post(endpoint, json=payload, timeout=REQUEST_TIMEOUT_S)
+        response = requests.post(
+            endpoint,
+            json={"prompt": prompt, "n_predict": n_predict, "stream": False},
+            timeout=REQUEST_TIMEOUT_S,
+        )
         response.raise_for_status()
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"{model_name} request failed: {exc}") from exc
@@ -119,22 +131,20 @@ def route(body: RouteRequest) -> Any:
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=f"{model_name} returned non-JSON") from exc
 
-    raw_output = extract_raw_text(upstream)
-    conversation_id = db.save_raw_output(
-        prompt=body.prompt,
-        raw_output=raw_output,
-        persona=body.persona,
-        task=body.task,
-        model=model_name,
-    )
-    cleaned = clean_output(raw_output)
-    db.save_clean_output(conversation_id, cleaned)
+    raw = extract_raw_text(upstream)
+    db.save_raw_output(f"raw:{user_id}", raw)
+    clean = clean_output(raw)
+    db.update_conversation(user_id, bot_name, persona, task, clean)
+    db.set_cooldown(user_id, COOLDOWN_SECONDS)
 
     return {
-        "content": cleaned,
-        "reply": cleaned,
+        "clean": clean,
+        "raw": raw,
+        "content": clean,
+        "reply": clean,
         "model": model_name,
-        "persona": body.persona,
-        "task": body.task,
-        "conversation_id": conversation_id,
+        "persona": persona,
+        "task": task,
+        "user_id": user_id,
+        "bot_name": bot_name,
     }
