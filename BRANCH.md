@@ -1,23 +1,20 @@
 # feature/agent-tools
 
-Working branch for the bounded browser-agent slice. Ready for review; do not merge until you're happy with the remaining nits.
+Ready for review. Do not merge until you're happy with the remaining nits.
 
 ## Done
 
-- **Every persona** in `personas.json` is an `agents` row (wendy, gumbo, tabatha, tech, creative, analysis), each with its own Playwright context, `sessions.context`, `events`, and `memories`.
-- Stateful Playwright: one Chromium context per persona. `storageState()` → `data/browser/<persona>.json` + `tools.tool_state`. Closed/crashed pages are recreated. Cookies are not saved on a blocked challenge page.
-- Tools: `browser_goto`, `browser_read`, `browser_click`, `browser_type`, `browser_submit`, `web_fetch`. Same `/tool` shape.
-- Blocked pages return `status=blocked` plus a human `message` (CAPTCHA, Cloudflare wait, login wall, timeout). Discord edits the ack instead of going silent.
-- Login-wall heuristic no longer fires on content pages that merely have a header "Log in" link — needs a visible password field *and* a login URL/title.
-- Memory split: `sessions.context` (trimmed scratch, also updated from `/tool`), `events` (audit), `memories` (extractive notes after a loop / every 8 events).
-- Bounded loop: 6 steps, 60s wall clock, always leaves time for one model call. URL bootstrap goto+read; if that hits a wall the user gets the blocked message immediately.
-- Discord: `@bot !browse` / `!web` ack-then-edit; catch path edits the placeholder so it never stays "On it…".
+- **GBNF planner**: llama.cpp grammar forces `{"tool", "args"}` or `{"reply"}`. Tool-only grammar until the first action when the user named a URL; reply-only grammar once we have the page text we need. Persona prose is kept out of the planner prompt so it cannot fight the JSON.
+- **Multi-step chains**: verified `goto → read` (heading) and `goto → click → read` (Learn more landed on IANA “Example Domains”).
+- **Every persona** has its own browser context, session, events, memories.
+- **Auto-login**: `credentials` rows (JSON in `encrypted_key`; LAN-only, no extra crypto). `browser_login` fills selectors; secrets never enter the model prompt. Login-wall in the loop tries `browser_login` once. Fixture: `http://127.0.0.1:9000/debug/login` (wendy / snacktime) → `/debug/secret`.
+- Blocked pages still return a human `message`; Discord ack-then-edit.
 - Unit tests: `python3 router/tests/test_hardening.py`
-- Verified live: all six personas goto+read example.{com,net,org}; gumbo agent loop wrote session + memory.
 
-## Still rough (acceptable for review)
+## Still rough (ok to land later)
 
-- Local GGUF models still rarely emit `{"tool":...}`; URL bootstrap remains the planner for `!browse`.
-- No screenshots, no auto-login from `credentials`.
-- One Chromium process — don't run multiple uvicorn workers.
+- Screenshots.
+- Multiple uvicorn workers / multiple Chromium processes.
+- Reply text can slightly paraphrase (`waffle-42` vs `waffle-iron-42`) — GBNF reply is a short string, not a quote engine.
 - Discord bot patches live in `~/vibe-hub/discord-bots`, not this git repo.
+- `encrypted_key` is JSON plaintext unless we add CREDENTIALS_KEY later.

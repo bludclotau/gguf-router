@@ -198,6 +198,34 @@ def _clean_text(raw: str) -> str:
     return text.strip()[:READ_CHAR_CAP]
 
 
+def _page_actions(page) -> dict:
+    """Cheap interactive inventory so the planner can click/type without guessing."""
+    try:
+        return page.evaluate(
+            """() => {
+              const clip = (s, n) => (s || "").trim().replace(/\\s+/g, " ").slice(0, n);
+              const links = [...document.querySelectorAll("a[href]")]
+                .slice(0, 12)
+                .map(a => ({text: clip(a.innerText, 60), href: a.href}))
+                .filter(x => x.text);
+              const buttons = [...document.querySelectorAll("button, [role=button], input[type=submit]")]
+                .slice(0, 8)
+                .map(b => clip(b.innerText || b.value || b.getAttribute("aria-label"), 40))
+                .filter(Boolean);
+              const inputs = [...document.querySelectorAll("input, textarea, select")]
+                .slice(0, 8)
+                .map(i => ({
+                  type: i.type || i.tagName.toLowerCase(),
+                  name: i.name || i.id || "",
+                  placeholder: clip(i.placeholder, 40),
+                }));
+              return {links, buttons, inputs};
+            }"""
+        )
+    except Exception:
+        return {"links": [], "buttons": [], "inputs": []}
+
+
 def classify_block(title: str, url: str, body: str = "", visible_password: int = 0, hits: tuple = ()) -> dict | None:
     """Pure helper so we can unit-test without Playwright."""
     title = title or ""
@@ -339,10 +367,12 @@ def browser_read(persona: str = "unknown", **_):
             except Exception:
                 body = page.inner_text("html")
             text = _clean_text(body)
-            snap = _snapshot(page, extra={"text": text}, check_block=False)
+            actions = _page_actions(page)
+            snap = _snapshot(page, extra={"text": text, "actions": actions}, check_block=False)
             if blocked:
                 snap.update(blocked)
                 snap["text"] = text
+                snap["actions"] = actions
                 snap["message"] = format_block_message(snap)
             return snap
         except Exception as exc:
@@ -404,3 +434,81 @@ def browser_submit(selector: str | None = None, persona: str = "unknown", **_):
             return snap
         except Exception as exc:
             return {"status": "error", "error": str(exc), "selector": selector}
+
+
+def _first_fillable(page, selectors: list[str]):
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                return loc.first
+        except Exception:
+            continue
+    return None
+
+
+def browser_login(persona: str = "unknown", url: str | None = None, site: str | None = None, **_):
+    """Fill stored credentials. Secrets never go through the model."""
+    persona = normalize_persona(persona)
+    with _lock:
+        try:
+            page = _ensure_page(persona)
+            target = url or site or page.url
+            cred = db.get_credential(persona, target)
+            if not cred:
+                return {
+                    "status": "blocked",
+                    "reason": "login_wall",
+                    "url": page.url,
+                    "message": f"No saved login for {target}. I can't sign in.",
+                }
+            login_url = cred.get("login_url") or url
+            if login_url:
+                page.goto(login_url, timeout=GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
+            user_sel = cred.get("user_selector")
+            pass_sel = cred.get("pass_selector")
+            user_box = _first_fillable(
+                page,
+                [s for s in [user_sel, "input[type=email]", "input[name=username]", "input[name=email]", "input[type=text]"] if s],
+            )
+            pass_box = _first_fillable(
+                page,
+                [s for s in [pass_sel, "input[type=password]"] if s],
+            )
+            if user_box is None or pass_box is None:
+                return {"status": "error", "error": "login_fields_missing", "url": page.url}
+            user_box.fill(str(cred.get("username") or ""))
+            pass_box.fill(str(cred.get("password") or ""))
+            submit_sel = cred.get("submit_selector")
+            submitted = False
+            if submit_sel:
+                try:
+                    page.locator(submit_sel).first.click(timeout=ACTION_TIMEOUT_MS)
+                    submitted = True
+                except Exception:
+                    submitted = False
+            if not submitted:
+                try:
+                    pass_box.press("Enter")
+                except Exception:
+                    btn = _first_fillable(page, ["button[type=submit]", "input[type=submit]", "button"])
+                    if btn:
+                        btn.click(timeout=ACTION_TIMEOUT_MS)
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                page.wait_for_timeout(800)
+            snap = _snapshot(page, extra={"logged_in": True}, wait_challenge=True)
+            if snap.get("status") != "blocked":
+                _save_storage(persona)
+            return snap
+        except PlaywrightTimeout:
+            return {
+                "status": "blocked",
+                "reason": "timeout",
+                "url": url or site,
+                "message": format_block_message({"reason": "timeout", "url": url or site}),
+            }
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+

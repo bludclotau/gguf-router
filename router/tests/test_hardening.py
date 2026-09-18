@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from agent_loop import parse_tool_call, resolve_agent_name
+from agent_loop import parse_plan, parse_tool_call, resolve_agent_name
 from tools.browser import classify_block, format_block_message, normalize_persona
 
 
@@ -34,6 +34,10 @@ def test_parse_tool_call():
     wrapped = 'Sure.\n{"tool":"browser_read","args":{}}\n'
     assert parse_tool_call(wrapped)["tool"] == "browser_read"
     assert parse_tool_call("just chatting") is None
+    reply = parse_plan('{"reply":"Example Domain is the heading."}')
+    assert reply == {"kind": "reply", "reply": "Example Domain is the heading."}
+    both = parse_plan('{"tool":"browser_read","args":{}}')
+    assert both["kind"] == "tool"
 
 
 def test_challenge_and_captcha():

@@ -1,8 +1,8 @@
 """Bounded propose → tool → re-prompt loop.
 
-Caps: MAX_STEPS tool calls and WALL_CLOCK_S seconds. This is meant to feel
-like a chat reply, not a background crawler. If the budget expires we
-return a partial "here's what I found" instead of hanging Discord.
+The planner is a separate, grammar-constrained llama.cpp call (GBNF).
+Persona prose is kept out of that call so it cannot fight the JSON schema.
+Final `{reply}` is what Discord sees. Secrets never enter the planner prompt.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import requests
 
 import db
 from cleaner import clean_output
-from persona_engine import apply
 from tools.browser import format_block_message, normalize_persona
 from tools.registry import run_tool
 
@@ -25,20 +24,25 @@ MAX_STEPS = 6
 WALL_CLOCK_S = 60
 TOOL_RESULT_CAP = 1800
 MIN_MODEL_SECONDS = 8
+PLANNER_TOKENS = 96
+PLANNER_TEMP = 0.2
 
-TOOL_HINT = """
-You may use tools. Output ONLY a JSON object to call one:
-{"tool":"browser_goto","args":{"url":"https://example.com"}}
-{"tool":"browser_read","args":{}}
-{"tool":"browser_click","args":{"selector":"text=Learn more"}}
-{"tool":"browser_type","args":{"selector":"#q","text":"hello"}}
-{"tool":"browser_submit","args":{"selector":"form"}}
-{"tool":"web_fetch","args":{"url":"https://example.com"}}
-When you can answer the user, reply in character with no JSON and no tool call.
-If a tool result has status "blocked", tell the user you hit a wall. Do not invent page content.
-""".strip()
+GRAMMAR_DIR = Path(__file__).resolve().parent / "grammar"
+GRAMMAR = (GRAMMAR_DIR / "tool_call.gbnf").read_text(encoding="utf-8") if (GRAMMAR_DIR / "tool_call.gbnf").is_file() else ""
+GRAMMAR_TOOL_ONLY = (GRAMMAR_DIR / "tool_only.gbnf").read_text(encoding="utf-8") if (GRAMMAR_DIR / "tool_only.gbnf").is_file() else GRAMMAR
+GRAMMAR_REPLY_ONLY = (GRAMMAR_DIR / "reply_only.gbnf").read_text(encoding="utf-8") if (GRAMMAR_DIR / "reply_only.gbnf").is_file() else ""
+BROWSE_HINT = re.compile(r"\b(open|visit|browse|click|go to|goto|look up|log in|sign in|read)\b", re.I)
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
+
+PERSONA_ONE_LINERS = {
+    "wendy": "Wendy: warm, short, no speeches.",
+    "gumbo": "Gumbo: loud, punchy, no TED talk.",
+    "tabatha": "Tabatha: playful, compact.",
+    "tech": "Tech: exact, no fluff.",
+    "creative": "Creative: sensory, brief.",
+    "analysis": "Analysis: structured, brief.",
+}
 
 
 def known_personas() -> tuple[str, ...]:
@@ -51,7 +55,6 @@ def known_personas() -> tuple[str, ...]:
 
 
 def resolve_agent_name(persona: Optional[str], bot_name: Optional[str]) -> str:
-    """Prefer an explicit persona from personas.json, else the Discord bot name."""
     names = {n.lower() for n in known_personas()}
     for candidate in (persona, bot_name):
         if candidate and str(candidate).lower() in names:
@@ -60,13 +63,19 @@ def resolve_agent_name(persona: Optional[str], bot_name: Optional[str]) -> str:
 
 
 def parse_tool_call(text: str) -> Optional[dict[str, Any]]:
+    plan = parse_plan(text)
+    if plan and plan.get("kind") == "tool":
+        return {"tool": plan["tool"], "args": plan.get("args") or {}}
+    return None
+
+
+def parse_plan(text: str) -> Optional[dict[str, Any]]:
     if not text:
         return None
     stripped = text.strip()
+    candidates = []
     try:
-        data = json.loads(stripped)
-        if isinstance(data, dict) and data.get("tool"):
-            return {"tool": data["tool"], "args": data.get("args") or {}}
+        candidates.append(json.loads(stripped))
     except Exception:
         pass
     start = stripped.find("{")
@@ -96,13 +105,18 @@ def parse_tool_call(text: str) -> Optional[dict[str, Any]]:
         if end is None:
             break
         try:
-            data = json.loads(stripped[start : end + 1])
+            candidates.append(json.loads(stripped[start : end + 1]))
         except Exception:
-            data = None
-        if isinstance(data, dict) and data.get("tool"):
-            args = data.get("args") if isinstance(data.get("args"), dict) else {}
-            return {"tool": str(data["tool"]), "args": args}
+            pass
         start = stripped.find("{", start + 1)
+    for data in candidates:
+        if not isinstance(data, dict):
+            continue
+        if isinstance(data.get("reply"), str) and not data.get("tool"):
+            return {"kind": "reply", "reply": data["reply"]}
+        if data.get("tool"):
+            args = data.get("args") if isinstance(data.get("args"), dict) else {}
+            return {"kind": "tool", "tool": str(data["tool"]), "args": args}
     return None
 
 
@@ -110,27 +124,129 @@ def _compact_result(result: Any) -> str:
     if isinstance(result, dict):
         slim = {
             k: result[k]
-            for k in ("status", "reason", "url", "title", "text", "error", "clicked", "message")
+            for k in ("status", "reason", "url", "title", "text", "error", "clicked", "message", "logged_in")
             if k in result
         }
+        actions = result.get("actions")
+        if isinstance(actions, dict):
+            slim["buttons"] = (actions.get("buttons") or [])[:6]
+            slim["links"] = [
+                {"text": x.get("text"), "href": x.get("href")}
+                for x in (actions.get("links") or [])[:6]
+                if isinstance(x, dict)
+            ]
+            slim["inputs"] = actions.get("inputs") or []
         text = slim.get("text")
-        if isinstance(text, str) and len(text) > 900:
-            slim["text"] = text[:900]
+        if isinstance(text, str) and len(text) > 700:
+            slim["text"] = text[:700]
         result = slim
     blob = json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result
     return blob[:TOOL_RESULT_CAP]
 
 
-def _call_model(endpoint: str, prompt: str, n_predict: int) -> str:
-    r = requests.post(
-        endpoint,
-        json={"prompt": prompt, "n_predict": n_predict},
-        timeout=120,
-    )
+def _must_act_first(user_prompt: str, working: dict, steps: list) -> bool:
+    if steps:
+        return False
+    if URL_RE.search(user_prompt or ""):
+        return True
+    if working.get("url"):
+        return False
+    return bool(BROWSE_HINT.search(user_prompt or ""))
+
+
+def _should_reply_now(user_prompt: str, steps: list, working: dict) -> bool:
+    """Stop tool-churn: once we have page text that answers, force a reply."""
+    if not steps or not (working.get("last_read") or working.get("title")):
+        return False
+    tools = [s["tool"] for s in steps]
+    prompt_l = (user_prompt or "").lower()
+    wants_click = "click" in prompt_l
+    wants_login = "secret" in prompt_l or "log in" in prompt_l or "sign in" in prompt_l
+    if wants_login and "browser_login" not in tools:
+        title = (working.get("title") or "").lower()
+        url = (working.get("url") or "").lower()
+        on_login = "log in" in title or "/login" in url or "sign in" in title
+        if on_login:
+            return False
+        # Already past the wall (e.g. storageState session). Answer from the page.
+        return bool(working.get("last_read"))
+    if tools[-2:] == ["browser_read", "browser_read"]:
+        return True
+    if wants_click:
+        if "browser_click" not in tools:
+            return False
+        idx = tools.index("browser_click")
+        return "browser_read" in tools[idx + 1 :]
+    if wants_login:
+        if "browser_login" in tools:
+            idx = tools.index("browser_login")
+            return "browser_read" in tools[idx + 1 :]
+        return False
+    return "browser_read" in tools or "web_fetch" in tools
+
+
+def _call_planner(endpoint: str, prompt: str, n_predict: int, grammar: str | None = None) -> str:
+    payload = {
+        "prompt": prompt,
+        "n_predict": min(n_predict or PLANNER_TOKENS, PLANNER_TOKENS),
+        "temperature": PLANNER_TEMP,
+        "stop": ["\n\nUser:", "\nUser:"],
+    }
+    chosen = grammar if grammar is not None else GRAMMAR
+    if chosen:
+        payload["grammar"] = chosen
+    r = requests.post(endpoint, json=payload, timeout=120)
     r.raise_for_status()
     data = r.json()
     raw = data.get("content") if isinstance(data, dict) else ""
     return raw or ""
+
+
+def _planner_prompt(agent_name: str, user_prompt: str, working: dict, steps: list, sites: list[str]) -> str:
+    tone = PERSONA_ONE_LINERS.get(agent_name, f"{agent_name}: brief.")
+    page = "none"
+    if working.get("url"):
+        page = f"{working.get('title') or ''} {working.get('url')}"
+    last_read = (working.get("last_read") or "")[:500]
+    trace = []
+    for i, step in enumerate(steps, 1):
+        trace.append(f"{i}. {step['tool']} -> {step['result'][:350]}")
+    sites_line = ", ".join(sites) if sites else "none"
+    last_actions = ""
+    if steps:
+        try:
+            last = json.loads(steps[-1]["result"])
+            bits = []
+            if last.get("buttons"):
+                bits.append("buttons: " + ", ".join(f"text={b}" for b in last["buttons"][:6]))
+            if last.get("links"):
+                bits.append(
+                    "links: "
+                    + ", ".join(
+                        f"text={x.get('text')}" for x in last["links"][:6] if isinstance(x, dict)
+                    )
+                )
+            last_actions = "\n".join(bits)
+        except Exception:
+            last_actions = ""
+    return (
+        f"You are a tool planner for {tone}\n"
+        "Output ONE JSON object. Either a tool call or a final reply.\n"
+        'Tool: {"tool":"browser_goto","args":{"url":"https://example.com"}}\n'
+        'Tools: browser_goto, browser_read, browser_click (args.selector like text=Learn more), '
+        "browser_type, browser_submit, browser_login, web_fetch.\n"
+        'Prefer browser_* when you will click or log in. Use browser_login when the page needs a sign-in '
+        "and we have credentials.\n"
+        f"Credential sites: {sites_line}\n"
+        "When you have enough from Page/Excerpt/Trace, reply with a factual sentence. "
+        "If Page is none, call a tool first — do not reply yet.\n"
+        f"User: {user_prompt}\n"
+        f"Page: {page}\n"
+        f"Excerpt: {last_read}\n"
+        f"{last_actions}\n"
+        f"Trace:\n" + ("\n".join(trace) if trace else "(none)") + "\n"
+        "Next:\n"
+    )
 
 
 def _finalize_text(stopped: str, final_raw: str) -> str:
@@ -157,15 +273,14 @@ def run_bounded_agent(
     working = db.get_session_context(agent_name)
     turns = list(working.get("recent_turns") or [])
     turns.append({"role": "user", "content": prompt[:500]})
-
-    memories = db.get_memories(agent_name, limit=4)
-    memory_block = ""
-    if memories:
-        memory_block = "Durable notes:\n" + "\n".join(f"- {m}" for m in memories)
+    sites = db.list_credential_sites(agent_name)
+    tried_login = False
+    used_grammar = bool(GRAMMAR)
 
     def record_step(tool_name, args, result):
         compact = _compact_result(result)
-        steps.append({"tool": tool_name, "args": args, "result": compact})
+        public_args = {k: v for k, v in (args or {}).items() if k not in ("password", "username")}
+        steps.append({"tool": tool_name, "args": public_args, "result": compact})
         db.log_agent_event(
             agent_name,
             tool_name,
@@ -178,112 +293,123 @@ def run_bounded_agent(
             },
         )
         if isinstance(result, dict):
+            old_url = working.get("url")
             if result.get("url"):
                 working["url"] = result["url"]
             if result.get("title"):
                 working["title"] = result["title"]
             if result.get("text"):
                 working["last_read"] = result["text"]
+            elif result.get("url") and result.get("url") != old_url:
+                working["last_read"] = ""
             working["last_tool"] = {"name": tool_name, "status": result.get("status")}
         return result
 
-    seeded = URL_RE.search(prompt or "")
-    if seeded:
-        seed_url = seeded.group(0).rstrip(").,]")
-        goto = run_tool(
-            "browser_goto",
-            {"url": seed_url, "persona": agent_name},
-            bot_name=agent_name,
-            user_id=user_id,
-        )
-        record_step("browser_goto", {"url": seed_url}, goto)
-        if isinstance(goto, dict) and goto.get("status") == "blocked":
-            msg = goto.get("message") or format_block_message(goto)
-            working["recent_turns"] = turns
-            db.set_session_context(agent_name, working)
-            db.maybe_consolidate(agent_name, user_id=user_id, force=True)
-            return {
-                "clean": msg,
-                "raw": msg,
-                "steps": steps,
-                "stopped": "blocked",
-                "blocked": True,
-                "blocked_reason": goto.get("reason"),
-                "agent": agent_name,
-            }
-        read = run_tool(
-            "browser_read",
-            {"persona": agent_name},
-            bot_name=agent_name,
-            user_id=user_id,
-        )
-        record_step("browser_read", {}, read)
-        if isinstance(read, dict) and read.get("status") == "blocked":
-            msg = read.get("message") or format_block_message(read)
-            working["recent_turns"] = turns
-            db.set_session_context(agent_name, working)
-            db.maybe_consolidate(agent_name, user_id=user_id, force=True)
-            return {
-                "clean": msg,
-                "raw": msg,
-                "steps": steps,
-                "stopped": "blocked",
-                "blocked": True,
-                "blocked_reason": read.get("reason"),
-                "agent": agent_name,
-            }
-
-    def build_prompt(tool_trace: list[dict[str, Any]]) -> str:
-        page_line = ""
-        if working.get("url"):
-            page_line = f"Current page: {working.get('title') or ''} {working.get('url')}\n"
-        trace_lines = []
-        for i, step in enumerate(tool_trace, 1):
-            trace_lines.append(f"{i}. {step['tool']} -> {step['result'][:400]}")
-        trace_block = "\n".join(trace_lines)
-        extra = "\n".join(
-            x for x in (TOOL_HINT, memory_block, page_line, f"Tool trace:\n{trace_block}" if trace_block else "") if x
-        )
-        assembled, _model = apply(
-            persona or agent_name,
-            task,
-            prompt,
-            user_id,
-            tool="browser",
-            tool_result=extra or None,
-        )
-        return assembled
+    def finish(stopped, final_raw, blocked_reason=None):
+        clean = _finalize_text(stopped, final_raw)
+        turns.append({"role": "assistant", "content": (clean or final_raw)[:500]})
+        working["recent_turns"] = turns
+        working["task_notes"] = (prompt or "")[:240]
+        db.set_session_context(agent_name, working)
+        db.maybe_consolidate(agent_name, user_id=user_id, force=True)
+        return {
+            "clean": clean,
+            "raw": final_raw,
+            "steps": steps,
+            "stopped": stopped,
+            "blocked": stopped == "blocked",
+            "blocked_reason": blocked_reason,
+            "agent": agent_name,
+            "planner": "gbnf" if used_grammar else "fallback",
+        }
 
     final_raw = ""
     stopped = "answered"
     blocked_reason = None
+
     while len(steps) < MAX_STEPS and time.time() < deadline:
         remaining = deadline - time.time()
         if remaining < MIN_MODEL_SECONDS and steps:
             stopped = "budget"
             break
         try:
-            raw = _call_model(endpoint, build_prompt(steps), n_predict)
+            if _should_reply_now(prompt, steps, working) and GRAMMAR_REPLY_ONLY:
+                grammar = GRAMMAR_REPLY_ONLY
+            elif _must_act_first(prompt, working, steps):
+                grammar = GRAMMAR_TOOL_ONLY
+            else:
+                grammar = GRAMMAR
+            raw = _call_planner(
+                endpoint,
+                _planner_prompt(agent_name, prompt, working, steps, sites),
+                n_predict,
+                grammar=grammar,
+            )
         except Exception as exc:
             stopped = "model_error"
             final_raw = f"The model dropped out ({exc}). Here's what I had before that."
             if steps:
                 final_raw += " " + " | ".join(s["result"][:160] for s in steps[-2:])
             break
-        call = parse_tool_call(raw)
-        if not call:
-            final_raw = raw
+        plan = parse_plan(raw)
+        if plan is None:
+            # Grammar failed or unconstrained junk. Last-resort URL bootstrap once.
+            seeded = URL_RE.search(prompt or "")
+            if seeded and not steps:
+                seed_url = seeded.group(0).rstrip(").,]")
+                goto = run_tool(
+                    "browser_goto",
+                    {"url": seed_url, "persona": agent_name},
+                    bot_name=agent_name,
+                    user_id=user_id,
+                )
+                record_step("browser_goto", {"url": seed_url}, goto)
+                continue
+            final_raw = raw or "I couldn't plan the next step."
             stopped = "answered"
             break
-        tool_name = call["tool"]
-        args = dict(call.get("args") or {})
+        if plan["kind"] == "reply":
+            final_raw = plan["reply"]
+            stopped = "answered"
+            break
+
+        tool_name = plan["tool"]
+        args = dict(plan.get("args") or {})
         args.setdefault("persona", agent_name)
+        prompt_urls = [u.rstrip(").,]") for u in URL_RE.findall(prompt or "")]
+        if tool_name in ("browser_goto", "web_fetch") and prompt_urls:
+            arg_url = args.get("url") or ""
+            if not arg_url or not any(p in arg_url or arg_url in p for p in prompt_urls):
+                args["url"] = prompt_urls[0]
         result = run_tool(tool_name, args, bot_name=agent_name, user_id=user_id)
         record_step(tool_name, args, result)
+
         if isinstance(result, dict) and result.get("status") == "blocked":
+            if result.get("reason") == "login_wall" and not tried_login:
+                tried_login = True
+                login = run_tool(
+                    "browser_login",
+                    {"url": result.get("url") or args.get("url"), "persona": agent_name},
+                    bot_name=agent_name,
+                    user_id=user_id,
+                )
+                record_step("browser_login", {"url": result.get("url")}, login)
+                if isinstance(login, dict) and login.get("status") != "blocked":
+                    read = run_tool(
+                        "browser_read",
+                        {"persona": agent_name},
+                        bot_name=agent_name,
+                        user_id=user_id,
+                    )
+                    record_step("browser_read", {}, read)
+                    continue
+                result = login
             stopped = "blocked"
-            blocked_reason = result.get("reason")
-            final_raw = result.get("message") or format_block_message(result)
+            blocked_reason = result.get("reason") if isinstance(result, dict) else "challenge"
+            final_raw = (
+                (result.get("message") if isinstance(result, dict) else None)
+                or format_block_message(result if isinstance(result, dict) else {})
+            )
             break
     else:
         if not final_raw:
@@ -293,19 +419,4 @@ def run_bounded_agent(
         bits = [s["result"][:200] for s in steps] or ["nothing yet"]
         final_raw = "I ran out of time. Here's what I found so far: " + " | ".join(bits)
 
-    clean = _finalize_text(stopped, final_raw)
-    turns.append({"role": "assistant", "content": (clean or final_raw)[:500]})
-    working["recent_turns"] = turns
-    working["task_notes"] = (prompt or "")[:240]
-    db.set_session_context(agent_name, working)
-    db.maybe_consolidate(agent_name, user_id=user_id, force=True)
-
-    return {
-        "clean": clean,
-        "raw": final_raw,
-        "steps": steps,
-        "stopped": stopped,
-        "blocked": stopped == "blocked",
-        "blocked_reason": blocked_reason,
-        "agent": agent_name,
-    }
+    return finish(stopped, final_raw, blocked_reason)

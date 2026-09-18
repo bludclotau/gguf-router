@@ -58,6 +58,9 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE INDEX IF NOT EXISTS idx_memories_agent_created
     ON memories (agent_id, created_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS credentials_agent_site_key
+    ON credentials (agent_id, site);
 """
 
 def _persona_names() -> tuple[str, ...]:
@@ -150,6 +153,21 @@ def init_schema() -> bool:
             ensure_agent(name)
         except Exception:
             pass
+    try:
+        upsert_credential(
+            "wendy",
+            "127.0.0.1",
+            {
+                "username": "wendy",
+                "password": "snacktime",
+                "login_url": "http://127.0.0.1:9000/debug/login",
+                "user_selector": "input[name=username]",
+                "pass_selector": "input[type=password]",
+                "submit_selector": "button[type=submit]",
+            },
+        )
+    except Exception:
+        pass
     return True
 
 
@@ -481,3 +499,69 @@ def load_browser_state(persona):
         return None
     state = row["tool_state"]
     return dict(state) if isinstance(state, dict) else None
+
+
+def _host(site_or_url: str) -> str:
+    raw = (site_or_url or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        return raw.lower().split("/")[0]
+    from urllib.parse import urlparse
+    return (urlparse(raw).hostname or "").lower()
+
+
+def upsert_credential(agent_name, site, payload):
+    """payload is a dict (username/password/selectors). Stored as JSON in encrypted_key.
+
+    Judgment call: LAN-only store, no extra crypto unless CREDENTIALS_KEY is set later.
+    """
+    agent_id = ensure_agent(agent_name)
+    blob = json.dumps(payload if isinstance(payload, dict) else {"value": str(payload)})
+    host = _host(site) or site
+    _run_write(
+        """
+        INSERT INTO credentials (agent_id, site, encrypted_key)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (agent_id, site) DO UPDATE
+        SET encrypted_key = EXCLUDED.encrypted_key
+        """,
+        (agent_id, host, blob),
+    )
+
+
+def get_credential(agent_name, site_or_url):
+    agent_id = ensure_agent(agent_name)
+    host = _host(site_or_url)
+    with _write_lock:
+        cur = _cursor(dict_cursor=True)
+        cur.execute(
+            "SELECT site, encrypted_key FROM credentials WHERE agent_id = %s",
+            (agent_id,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+    for row in rows:
+        site = (row["site"] or "").lower()
+        if not site:
+            continue
+        if host == site or host.endswith("." + site) or site == host:
+            try:
+                data = json.loads(row["encrypted_key"])
+            except Exception:
+                data = {"password": row["encrypted_key"]}
+            if isinstance(data, dict):
+                data.setdefault("site", site)
+                return data
+    return None
+
+
+def list_credential_sites(agent_name):
+    agent_id = ensure_agent(agent_name)
+    with _write_lock:
+        cur = _cursor()
+        cur.execute("SELECT site FROM credentials WHERE agent_id = %s", (agent_id,))
+        rows = cur.fetchall()
+        cur.close()
+    return [r[0] for r in rows if r and r[0]]
+

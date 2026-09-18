@@ -5,7 +5,8 @@ from typing import Any, Optional
 import json
 import yaml
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 import db
@@ -98,6 +99,35 @@ def extract_raw_text(payload: Any) -> str:
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"status": "router-ok"}
+
+
+@app.get("/debug/login", response_class=HTMLResponse)
+def debug_login():
+    """Local login fixture for auto-login tests. Not a public product surface."""
+    return """<!doctype html><html><head><title>Log in</title></head><body>
+    <h1>Log in</h1>
+    <form method="get" action="/debug/login/go">
+      <input name="username" type="text">
+      <input name="password" type="password">
+      <button type="submit">Log in</button>
+    </form>
+    </body></html>"""
+
+
+@app.get("/debug/login/go")
+def debug_login_go(username: str = "", password: str = ""):
+    if username == "wendy" and password == "snacktime":
+        resp = RedirectResponse("/debug/secret", status_code=303)
+        resp.set_cookie("fixture_auth", "wendy", httponly=True)
+        return resp
+    return HTMLResponse("<html><title>Log in</title><p>bad credentials</p></html>", status_code=401)
+
+
+@app.get("/debug/secret", response_class=HTMLResponse)
+def debug_secret(request: Request):
+    if request.cookies.get("fixture_auth") != "wendy":
+        return RedirectResponse("/debug/login", status_code=303)
+    return "<html><title>Secret</title><h1>SECRET waffle-iron-42</h1></html>"
 
 
 @app.post("/tool")
@@ -199,6 +229,7 @@ def route(payload: RouteRequest) -> Any:
             "stopped": outcome.get("stopped"),
             "blocked": bool(outcome.get("blocked")),
             "blocked_reason": outcome.get("blocked_reason"),
+            "planner": outcome.get("planner"),
             "steps": outcome.get("steps"),
         }
 

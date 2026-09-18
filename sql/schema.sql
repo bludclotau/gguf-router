@@ -44,3 +44,6 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE INDEX IF NOT EXISTS idx_memories_agent_created
     ON memories (agent_id, created_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS credentials_agent_site_key
+    ON credentials (agent_id, site);

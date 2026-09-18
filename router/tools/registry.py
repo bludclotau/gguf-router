@@ -1,6 +1,7 @@
 from tools.browser import (
     browser_click,
     browser_goto,
+    browser_login,
     browser_read,
     browser_submit,
     browser_type,
@@ -14,6 +15,7 @@ TOOL_REGISTRY = {
     "browser_click": browser_click,
     "browser_type": browser_type,
     "browser_submit": browser_submit,
+    "browser_login": browser_login,
 }
 
 
