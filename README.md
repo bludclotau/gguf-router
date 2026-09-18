@@ -2,7 +2,7 @@
 
 HTTP model router for llama.cpp nodes. Discord bots on snerloc POST to `/route` with `prompt` plus `persona` or `task`; the router forwards to Qwen (`10.1.1.122:8081`) or Dolphin (`10.1.1.122:8082`).
 
-After each completion the router caches raw llama.cpp output, strips role tags / grounding / XML / think blocks, logs the cleaned line to `conversations`, and enforces a 2s per-user cooldown. Clients should send `prompt`, `persona`, `task`, `user_id`, and `bot_name`, and read `response["clean"]`.
+`persona_engine.apply()` picks the model from `personas.json` / `tasks.json`, prepends `persona_prompts.yaml`, and injects per-user persona memory from PostgreSQL. After each completion the router caches raw llama.cpp output, strips role tags / grounding / XML / think blocks, logs the cleaned line to `conversations`, and enforces a 2s per-user cooldown. Clients should send `prompt`, `persona`, `task`, `user_id`, and `bot_name`, and read `response["clean"]`.
 
 ```bash
 curl -X POST http://localhost:9000/route \

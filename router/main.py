@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 import db
 from cleaner import clean_output
+from persona_engine import apply
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -109,29 +110,26 @@ def route(payload: RouteRequest) -> Any:
     if db.check_cooldown(user_id):
         return {"clean": "Cooldown active.", "raw": None}
 
-    model_name = select_model(persona, task)
-    endpoint = MODELS.get(model_name, MODELS[DEFAULT_MODEL])
+    final_prompt, model = apply(persona, task, prompt, user_id)
+    endpoint = MODELS.get(model, MODELS["qwen"])
 
     n_predict = payload.n_predict if payload.n_predict is not None else payload.max_tokens
     if n_predict is None:
         n_predict = 256
 
     try:
-        response = requests.post(
+        r = requests.post(
             endpoint,
-            json={"prompt": prompt, "n_predict": n_predict, "stream": False},
+            json={"prompt": final_prompt, "n_predict": n_predict},
             timeout=REQUEST_TIMEOUT_S,
         )
-        response.raise_for_status()
+        r.raise_for_status()
+        raw = r.json().get("content", "")
     except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"{model_name} request failed: {exc}") from exc
-
-    try:
-        upstream = response.json()
+        raise HTTPException(status_code=502, detail=f"{model} request failed: {exc}") from exc
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail=f"{model_name} returned non-JSON") from exc
+        raise HTTPException(status_code=502, detail=f"{model} returned non-JSON") from exc
 
-    raw = extract_raw_text(upstream)
     db.save_raw_output(f"raw:{user_id}", raw)
     clean = clean_output(raw)
     db.update_conversation(user_id, bot_name, persona, task, clean)
@@ -142,7 +140,7 @@ def route(payload: RouteRequest) -> Any:
         "raw": raw,
         "content": clean,
         "reply": clean,
-        "model": model_name,
+        "model": model,
         "persona": persona,
         "task": task,
         "user_id": user_id,

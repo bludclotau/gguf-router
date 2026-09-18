@@ -151,6 +151,21 @@ def update_conversation(user_id, bot_name, persona, task, last_message):
     cur.close()
 
 
+def get_persona_memory(user_id, persona):
+    cur = _cursor(dict_cursor=True)
+    cur.execute(
+        """
+        SELECT last_message FROM conversations
+        WHERE user_id = %s AND persona = %s
+        ORDER BY updated_at DESC LIMIT 1
+        """,
+        (user_id, persona),
+    )
+    row = cur.fetchone()
+    cur.close()
+    return row["last_message"] if row else None
+
+
 def get_last_message(user_id=None, bot_name=None):
     clauses = []
     params = []
