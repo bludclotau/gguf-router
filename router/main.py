@@ -9,8 +9,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import db
+from agent_loop import run_bounded_agent
 from cleaner import clean_output
 from persona_engine import apply
+from tools import browser as browser_tools
 from tools.registry import run_tool
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -34,6 +36,7 @@ COOLDOWN_SECONDS = 2
 async def lifespan(_app: FastAPI):
     db.init_schema()
     yield
+    browser_tools.shutdown()
 
 
 app = FastAPI(title="gguf-router", lifespan=lifespan)
@@ -50,6 +53,7 @@ class RouteRequest(BaseModel):
     n_predict: Optional[int] = Field(default=256)
     max_tokens: Optional[int] = None
     stream: bool = False
+    agent: bool = False
 
 
 def select_model(persona: Optional[str], task: Optional[str]) -> str:
@@ -103,9 +107,10 @@ def tool(payload: dict) -> Any:
     user_id = payload.get("user_id", "unknown")
     bot_name = payload.get("bot_name", "discord")
 
-    result = run_tool(name, args)
+    result = run_tool(name, args, bot_name=bot_name, user_id=user_id)
     db.async_write(db.save_raw_output, f"tool:{user_id}:{name}", str(result))
     db.log_tool(user_id, name, str(result))
+    db.log_agent_event(bot_name, name or "tool", {"user_id": user_id, "status": (result or {}).get("status") if isinstance(result, dict) else "ok"})
     return {"result": result, "user_id": user_id, "bot_name": bot_name}
 
 
@@ -123,16 +128,17 @@ def route(payload: RouteRequest) -> Any:
     tool_name = payload.tool
     tool_result = None
     if tool_name:
-        tool_result = run_tool(tool_name, payload.args or {})
+        tool_result = run_tool(tool_name, payload.args or {}, bot_name=bot_name, user_id=user_id)
         db.async_write(db.save_raw_output, f"tool:{user_id}:{tool_name}", str(tool_result))
         db.log_tool(user_id, tool_name, str(tool_result))
+        db.log_agent_event(bot_name, tool_name, {"user_id": user_id, "status": (tool_result or {}).get("status") if isinstance(tool_result, dict) else "ok"})
 
     final_prompt, model = apply(
         persona,
         task,
         prompt,
         user_id,
-        tool=tool_name,
+        tool=tool_name or ("browser" if payload.agent else None),
         tool_result=tool_result,
     )
     endpoint = MODELS.get(model, MODELS["qwen"])
@@ -147,6 +153,35 @@ def route(payload: RouteRequest) -> Any:
     n_predict = payload.n_predict if payload.n_predict is not None else payload.max_tokens
     if n_predict is None:
         n_predict = 256
+
+    if payload.agent:
+        outcome = run_bounded_agent(
+            prompt=prompt,
+            persona=persona,
+            task=task,
+            user_id=user_id,
+            bot_name=bot_name,
+            endpoint=endpoint,
+            n_predict=n_predict,
+        )
+        clean = outcome["clean"]
+        raw = outcome["raw"]
+        db.async_write(db.save_raw_output, f"raw:{user_id}", raw)
+        db.async_write(db.update_conversation, user_id, bot_name, persona, task, clean)
+        db.set_cooldown(user_id, COOLDOWN_SECONDS)
+        return {
+            "clean": clean,
+            "raw": raw,
+            "content": clean,
+            "reply": clean,
+            "model": model,
+            "persona": persona,
+            "task": task,
+            "user_id": user_id,
+            "bot_name": bot_name,
+            "stopped": outcome.get("stopped"),
+            "steps": outcome.get("steps"),
+        }
 
     try:
         r = requests.post(

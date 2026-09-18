@@ -3,3 +3,5 @@ __pycache__/
 .venv/
 .env
 *.log
+data/browser/
+data/screenshots/
