@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -6,6 +7,9 @@ import yaml
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+import db
+from cleaner import clean_output
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -22,7 +26,14 @@ MODELS = CONFIG["models"]
 DEFAULT_MODEL = "qwen"
 REQUEST_TIMEOUT_S = 240
 
-app = FastAPI(title="gguf-router")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    db.init_schema()
+    yield
+
+
+app = FastAPI(title="gguf-router", lifespan=lifespan)
 
 
 class RouteRequest(BaseModel):
@@ -46,6 +57,29 @@ def select_model(persona: Optional[str], task: Optional[str]) -> str:
     return DEFAULT_MODEL
 
 
+def extract_raw_text(payload: Any) -> str:
+    if isinstance(payload, str):
+        return payload
+    if not isinstance(payload, dict):
+        return str(payload)
+
+    for key in ("content", "reply", "text", "response"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            if isinstance(first.get("text"), str) and first["text"]:
+                return first["text"]
+            message = first.get("message")
+            if isinstance(message, dict) and isinstance(message.get("content"), str):
+                return message["content"]
+    return json.dumps(payload)
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
@@ -53,6 +87,7 @@ def health() -> dict[str, Any]:
         "models": list(MODELS.keys()),
         "personas": PERSONAS,
         "tasks": TASKS,
+        "postgres": bool(db.DSN),
     }
 
 
@@ -80,6 +115,26 @@ def route(body: RouteRequest) -> Any:
         raise HTTPException(status_code=502, detail=f"{model_name} request failed: {exc}") from exc
 
     try:
-        return response.json()
+        upstream = response.json()
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=f"{model_name} returned non-JSON") from exc
+
+    raw_output = extract_raw_text(upstream)
+    conversation_id = db.save_raw_output(
+        prompt=body.prompt,
+        raw_output=raw_output,
+        persona=body.persona,
+        task=body.task,
+        model=model_name,
+    )
+    cleaned = clean_output(raw_output)
+    db.save_clean_output(conversation_id, cleaned)
+
+    return {
+        "content": cleaned,
+        "reply": cleaned,
+        "model": model_name,
+        "persona": body.persona,
+        "task": body.task,
+        "conversation_id": conversation_id,
+    }
