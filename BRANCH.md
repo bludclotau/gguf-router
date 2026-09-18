@@ -1,30 +1,23 @@
 # feature/agent-tools
 
-Working branch for the bounded browser-agent slice. Do not land on `main` until the rough items below are acceptable.
+Working branch for the bounded browser-agent slice. Ready for review; do not merge until you're happy with the remaining nits.
 
 ## Done
 
-- Stateful Playwright: one Chromium context per persona (`wendy` / `gumbo` / `tabatha`).
-- `storageState()` saved to `data/browser/<persona>.json` and `tools.tool_state`.
-- Tool actions: `browser_goto`, `browser_read` (clean text), `browser_click`, `browser_type`, `browser_submit`. Same `/tool` payload shape (`tool`, `args`, `user_id`, `bot_name`).
-- Blocked pages return `{"status":"blocked","reason":...}` (CAPTCHA, Cloudflare, login wall, timeout) instead of fake success.
-- Memory split on `agent_cluster`:
-  - `sessions.context` — trimmed scratch (URL, last read, last 6 turns)
-  - `events` — append-only audit (`event_type`, `payload`)
-  - `memories` — durable extractive notes after a loop / every 8 events
-- Bounded loop on `POST /route` with `"agent": true`: 5 tool steps, 45s wall clock; over-budget returns a partial summary.
-- URL bootstrap: if the prompt contains `http(s)://`, run goto+read before asking the model (local GGUF models rarely emit tool JSON).
-- Discord (in `~/vibe-hub/discord-bots`, not this repo): `@bot !browse <url>`, ack-then-edit replies.
-- Verified: Wendy `browser_goto` + `browser_read` on example.com, events + session + memory rows written.
+- **Every persona** in `personas.json` is an `agents` row (wendy, gumbo, tabatha, tech, creative, analysis), each with its own Playwright context, `sessions.context`, `events`, and `memories`.
+- Stateful Playwright: one Chromium context per persona. `storageState()` → `data/browser/<persona>.json` + `tools.tool_state`. Closed/crashed pages are recreated. Cookies are not saved on a blocked challenge page.
+- Tools: `browser_goto`, `browser_read`, `browser_click`, `browser_type`, `browser_submit`, `web_fetch`. Same `/tool` shape.
+- Blocked pages return `status=blocked` plus a human `message` (CAPTCHA, Cloudflare wait, login wall, timeout). Discord edits the ack instead of going silent.
+- Login-wall heuristic no longer fires on content pages that merely have a header "Log in" link — needs a visible password field *and* a login URL/title.
+- Memory split: `sessions.context` (trimmed scratch, also updated from `/tool`), `events` (audit), `memories` (extractive notes after a loop / every 8 events).
+- Bounded loop: 6 steps, 60s wall clock, always leaves time for one model call. URL bootstrap goto+read; if that hits a wall the user gets the blocked message immediately.
+- Discord: `@bot !browse` / `!web` ack-then-edit; catch path edits the placeholder so it never stays "On it…".
+- Unit tests: `python3 router/tests/test_hardening.py`
+- Verified live: all six personas goto+read example.{com,net,org}; gumbo agent loop wrote session + memory.
 
-## Still rough
+## Still rough (acceptable for review)
 
-- Dolphin/Qwen almost never emit `{"tool":...}` on their own; the URL bootstrap is a crutch, not a general planner.
-- No screenshots.
-- `credentials` table is unused — no auto-login.
-- Memory consolidation is extractive (`event_type + url + title`), not an LLM summary.
-- Browser pool is one process-wide Chromium; not safe with multiple uvicorn workers.
-- Selector language is CSS / `text=` only; no accessibility-tree agent.
-- Login-wall heuristic can fire on pages the agent is *trying* to log into (type/submit skip the check; goto/read do not).
-- Discord bot patches live outside this git repo.
-- No automated tests for the loop, blocked detection, or schema migrate.
+- Local GGUF models still rarely emit `{"tool":...}`; URL bootstrap remains the planner for `!browse`.
+- No screenshots, no auto-login from `credentials`.
+- One Chromium process — don't run multiple uvicorn workers.
+- Discord bot patches live in `~/vibe-hub/discord-bots`, not this git repo.

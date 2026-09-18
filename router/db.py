@@ -60,7 +60,19 @@ CREATE INDEX IF NOT EXISTS idx_memories_agent_created
     ON memories (agent_id, created_at DESC);
 """
 
-SEED_AGENTS = ("wendy", "gumbo", "tabatha")
+def _persona_names() -> tuple[str, ...]:
+    path = Path(__file__).resolve().parent / "personas.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        names = tuple(str(k).lower() for k in data.keys())
+        if names:
+            return names
+    except Exception:
+        pass
+    return ("wendy", "gumbo", "tabatha")
+
+
+SEED_AGENTS = _persona_names()
 SESSION_TURN_CAP = 6
 SESSION_READ_CAP = 1500
 CONSOLIDATE_EVERY = 8
@@ -241,7 +253,7 @@ def get_last_message(user_id=None, bot_name=None):
 def ensure_agent(name):
     """Return agents.id for a Discord persona, creating the row if needed."""
     if not name:
-        name = "wendy"
+        name = "unknown"
     name = str(name).lower()
     persona = json.dumps({"label": name})
     caps = json.dumps(["browser", "web_fetch"])
@@ -421,6 +433,21 @@ def maybe_consolidate(agent_name, user_id=None, force=False):
     note = _extractive_event_summary(rows)
     if note:
         add_memory(agent_name, note, user_id=user_id, source="event_consolidation")
+
+
+def touch_session_from_tool(agent_name, result):
+    """Keep sessions.context in sync for /tool as well as the agent loop."""
+    if not agent_name or not isinstance(result, dict):
+        return
+    ctx = get_session_context(agent_name)
+    if result.get("url"):
+        ctx["url"] = result["url"]
+    if result.get("title"):
+        ctx["title"] = result["title"]
+    if result.get("text"):
+        ctx["last_read"] = result["text"]
+    ctx["last_tool"] = {"status": result.get("status"), "reason": result.get("reason")}
+    set_session_context(agent_name, ctx)
 
 
 def save_browser_state(persona, state):

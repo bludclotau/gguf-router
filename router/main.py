@@ -107,11 +107,23 @@ def tool(payload: dict) -> Any:
     user_id = payload.get("user_id", "unknown")
     bot_name = payload.get("bot_name", "discord")
 
-    result = run_tool(name, args, bot_name=bot_name, user_id=user_id)
+    agent_name = payload.get("persona") or bot_name
+    result = run_tool(name, args, bot_name=agent_name, user_id=user_id)
     db.async_write(db.save_raw_output, f"tool:{user_id}:{name}", str(result))
     db.log_tool(user_id, name, str(result))
-    db.log_agent_event(bot_name, name or "tool", {"user_id": user_id, "status": (result or {}).get("status") if isinstance(result, dict) else "ok"})
-    return {"result": result, "user_id": user_id, "bot_name": bot_name}
+    db.log_agent_event(
+        agent_name,
+        name or "tool",
+        {"user_id": user_id, "status": (result or {}).get("status") if isinstance(result, dict) else "ok"},
+    )
+    db.touch_session_from_tool(agent_name, result)
+    if isinstance(result, dict) and result.get("status") == "blocked":
+        db.maybe_consolidate(agent_name, user_id=user_id, force=True)
+        result = dict(result)
+        result.setdefault("message", result.get("message"))
+    else:
+        db.maybe_consolidate(agent_name, user_id=user_id, force=False)
+    return {"result": result, "user_id": user_id, "bot_name": bot_name, "agent": agent_name}
 
 
 @app.post("/route")
@@ -131,7 +143,11 @@ def route(payload: RouteRequest) -> Any:
         tool_result = run_tool(tool_name, payload.args or {}, bot_name=bot_name, user_id=user_id)
         db.async_write(db.save_raw_output, f"tool:{user_id}:{tool_name}", str(tool_result))
         db.log_tool(user_id, tool_name, str(tool_result))
-        db.log_agent_event(bot_name, tool_name, {"user_id": user_id, "status": (tool_result or {}).get("status") if isinstance(tool_result, dict) else "ok"})
+        db.log_agent_event(
+            persona or bot_name,
+            tool_name,
+            {"user_id": user_id, "status": (tool_result or {}).get("status") if isinstance(tool_result, dict) else "ok"},
+        )
 
     final_prompt, model = apply(
         persona,
@@ -179,7 +195,10 @@ def route(payload: RouteRequest) -> Any:
             "task": task,
             "user_id": user_id,
             "bot_name": bot_name,
+            "agent": outcome.get("agent"),
             "stopped": outcome.get("stopped"),
+            "blocked": bool(outcome.get("blocked")),
+            "blocked_reason": outcome.get("blocked_reason"),
             "steps": outcome.get("steps"),
         }
 

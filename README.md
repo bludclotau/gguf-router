@@ -20,7 +20,7 @@ Tool harness: `POST /tool` with `{"tool":"web_fetch","args":{"url":"https://exam
 
 ### Bounded agents (browser + memory)
 
-This is a chat-scoped agent, not an open-ended crawler: **5 tool steps** and **45s wall clock** per `/route` with `"agent": true`. If the budget runs out the router returns a partial "here's what I found so far". If the prompt contains an `http(s)` URL, the loop **bootstraps** `browser_goto` + `browser_read` before asking the model — local GGUF models rarely emit valid tool JSON on their own.
+This is a chat-scoped agent, not an open-ended crawler: **6 tool steps** and **60s wall clock** per `/route` with `"agent": true`. If the budget runs out the router returns a partial "here's what I found so far". If the prompt contains an `http(s)` URL, the loop **bootstraps** `browser_goto` + `browser_read` before asking the model — local GGUF models rarely emit valid tool JSON on their own. A CAPTCHA / login wall returns a clear blocked message (and Discord edits the ack) instead of going silent.
 
 Stateful Playwright keeps **one Chromium context per persona**. Cookies go to `data/browser/<persona>.json` and `tools.tool_state`. CAPTCHA / Cloudflare / login walls return `{"status":"blocked","reason":...}` instead of pretending the page loaded.
 
