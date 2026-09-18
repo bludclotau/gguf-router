@@ -1,0 +1,3 @@
+models:
+  qwen: "http://10.1.1.122:8081/completion"
+  dolphin: "http://10.1.1.122:8082/completion"
