@@ -32,6 +32,7 @@ GRAMMAR = (GRAMMAR_DIR / "tool_call.gbnf").read_text(encoding="utf-8") if (GRAMM
 GRAMMAR_TOOL_ONLY = (GRAMMAR_DIR / "tool_only.gbnf").read_text(encoding="utf-8") if (GRAMMAR_DIR / "tool_only.gbnf").is_file() else GRAMMAR
 GRAMMAR_REPLY_ONLY = (GRAMMAR_DIR / "reply_only.gbnf").read_text(encoding="utf-8") if (GRAMMAR_DIR / "reply_only.gbnf").is_file() else ""
 BROWSE_HINT = re.compile(r"\b(open|visit|browse|click|go to|goto|look up|log in|sign in|read)\b", re.I)
+RECALL_HINT = re.compile(r"\b(remember|memories|memory|last time|what did you|what do you know)\b", re.I)
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
 
@@ -147,11 +148,9 @@ def _compact_result(result: Any) -> str:
 def _must_act_first(user_prompt: str, working: dict, steps: list) -> bool:
     if steps:
         return False
-    if URL_RE.search(user_prompt or ""):
-        return True
-    if working.get("url"):
-        return False
-    return bool(BROWSE_HINT.search(user_prompt or ""))
+    # Only force a tool when the user named a URL. Recall questions must be
+    # allowed to answer from durable memories without browsing.
+    return bool(URL_RE.search(user_prompt or ""))
 
 
 def _should_reply_now(user_prompt: str, steps: list, working: dict) -> bool:
@@ -204,14 +203,17 @@ def _call_planner(endpoint: str, prompt: str, n_predict: int, grammar: str | Non
 
 def _planner_prompt(agent_name: str, user_prompt: str, working: dict, steps: list, sites: list[str]) -> str:
     tone = PERSONA_ONE_LINERS.get(agent_name, f"{agent_name}: brief.")
+    recall = bool(RECALL_HINT.search(user_prompt or ""))
     page = "none"
-    if working.get("url"):
+    if working.get("url") and not recall:
         page = f"{working.get('title') or ''} {working.get('url')}"
-    last_read = (working.get("last_read") or "")[:500]
+    last_read = "" if recall else (working.get("last_read") or "")[:500]
     trace = []
     for i, step in enumerate(steps, 1):
         trace.append(f"{i}. {step['tool']} -> {step['result'][:350]}")
     sites_line = ", ".join(sites) if sites else "none"
+    notes = db.get_memories(agent_name, limit=5)
+    memory_block = "Durable memories:\n" + "\n".join(f"- {n}" for n in notes) if notes else "Durable memories: (none)"
     last_actions = ""
     if steps:
         try:
@@ -238,8 +240,10 @@ def _planner_prompt(agent_name: str, user_prompt: str, working: dict, steps: lis
         'Prefer browser_* when you will click or log in. Use browser_login when the page needs a sign-in '
         "and we have credentials.\n"
         f"Credential sites: {sites_line}\n"
-        "When you have enough from Page/Excerpt/Trace, reply with a factual sentence. "
-        "If Page is none, call a tool first — do not reply yet.\n"
+        f"{memory_block}\n"
+        "When you have enough from Page/Excerpt/Trace/memories, reply with a factual sentence. "
+        "If the user asks what you remember, use Durable memories and reply — do not invent a browse. "
+        "If Page is none and they named a URL, call a tool first — do not reply yet.\n"
         f"User: {user_prompt}\n"
         f"Page: {page}\n"
         f"Excerpt: {last_read}\n"
@@ -333,7 +337,9 @@ def run_bounded_agent(
             stopped = "budget"
             break
         try:
-            if _should_reply_now(prompt, steps, working) and GRAMMAR_REPLY_ONLY:
+            if RECALL_HINT.search(prompt or "") and db.get_memories(agent_name) and GRAMMAR_REPLY_ONLY:
+                grammar = GRAMMAR_REPLY_ONLY
+            elif _should_reply_now(prompt, steps, working) and GRAMMAR_REPLY_ONLY:
                 grammar = GRAMMAR_REPLY_ONLY
             elif _must_act_first(prompt, working, steps):
                 grammar = GRAMMAR_TOOL_ONLY

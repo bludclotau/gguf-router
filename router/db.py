@@ -7,6 +7,8 @@ from pathlib import Path
 import psycopg2
 import psycopg2.extras
 
+import cred_crypto
+
 _write_lock = threading.Lock()
 
 
@@ -166,6 +168,10 @@ def init_schema() -> bool:
                 "submit_selector": "button[type=submit]",
             },
         )
+    except Exception:
+        pass
+    try:
+        migrate_credentials()
     except Exception:
         pass
     return True
@@ -512,12 +518,9 @@ def _host(site_or_url: str) -> str:
 
 
 def upsert_credential(agent_name, site, payload):
-    """payload is a dict (username/password/selectors). Stored as JSON in encrypted_key.
-
-    Judgment call: LAN-only store, no extra crypto unless CREDENTIALS_KEY is set later.
-    """
+    """Encrypt payload (username/password/selectors) into credentials.encrypted_key."""
     agent_id = ensure_agent(agent_name)
-    blob = json.dumps(payload if isinstance(payload, dict) else {"value": str(payload)})
+    blob = cred_crypto.encrypt_payload(payload if isinstance(payload, dict) else {"value": str(payload)})
     host = _host(site) or site
     _run_write(
         """
@@ -530,13 +533,35 @@ def upsert_credential(agent_name, site, payload):
     )
 
 
+def migrate_credentials():
+    """Rewrite legacy plaintext JSON rows as enc:v1 Fernet tokens."""
+    with _write_lock:
+        cur = _cursor(dict_cursor=True)
+        cur.execute("SELECT id, encrypted_key FROM credentials")
+        rows = list(cur.fetchall() or [])
+        cur.close()
+    for row in rows:
+        blob = row["encrypted_key"]
+        if cred_crypto.is_encrypted(blob):
+            continue
+        try:
+            payload = cred_crypto.decrypt_blob(blob)
+            sealed = cred_crypto.encrypt_payload(payload)
+        except Exception:
+            continue
+        _run_write(
+            "UPDATE credentials SET encrypted_key = %s WHERE id = %s",
+            (sealed, row["id"]),
+        )
+
+
 def get_credential(agent_name, site_or_url):
     agent_id = ensure_agent(agent_name)
     host = _host(site_or_url)
     with _write_lock:
         cur = _cursor(dict_cursor=True)
         cur.execute(
-            "SELECT site, encrypted_key FROM credentials WHERE agent_id = %s",
+            "SELECT id, site, encrypted_key FROM credentials WHERE agent_id = %s",
             (agent_id,),
         )
         rows = cur.fetchall()
@@ -547,9 +572,17 @@ def get_credential(agent_name, site_or_url):
             continue
         if host == site or host.endswith("." + site) or site == host:
             try:
-                data = json.loads(row["encrypted_key"])
+                data = cred_crypto.decrypt_blob(row["encrypted_key"])
             except Exception:
-                data = {"password": row["encrypted_key"]}
+                return None
+            if not cred_crypto.is_encrypted(row["encrypted_key"]):
+                try:
+                    _run_write(
+                        "UPDATE credentials SET encrypted_key = %s WHERE id = %s",
+                        (cred_crypto.encrypt_payload(data), row["id"]),
+                    )
+                except Exception:
+                    pass
             if isinstance(data, dict):
                 data.setdefault("site", site)
                 return data

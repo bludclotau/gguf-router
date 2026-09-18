@@ -8,6 +8,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import json
+import os
+
+from cryptography.fernet import Fernet
+
+import cred_crypto
 from agent_loop import parse_plan, parse_tool_call, resolve_agent_name
 from tools.browser import classify_block, format_block_message, normalize_persona
 
@@ -58,6 +64,20 @@ def test_login_wall_not_header_login():
     assert wall2 and wall2["reason"] == "login_wall"
 
 
+def test_credential_roundtrip():
+    os.environ["CREDENTIALS_KEY"] = Fernet.generate_key().decode()
+    cred_crypto.reset_for_tests()
+    payload = {"username": "wendy", "password": "unit-secret"}
+    blob = cred_crypto.encrypt_payload(payload)
+    assert blob.startswith("enc:v1:")
+    assert "unit-secret" not in blob
+    out = cred_crypto.decrypt_blob(blob)
+    assert out["password"] == "unit-secret"
+    assert cred_crypto.redact(payload)["password"] == "[redacted]"
+    legacy = json.dumps(payload)
+    assert cred_crypto.decrypt_blob(legacy)["password"] == "unit-secret"
+
+
 def test_block_message_is_explicit():
     msg = format_block_message({"reason": "captcha", "url": "https://paywall.test/"})
     assert "CAPTCHA" in msg
@@ -73,6 +93,7 @@ if __name__ == "__main__":
         test_parse_tool_call,
         test_challenge_and_captcha,
         test_login_wall_not_header_login,
+        test_credential_roundtrip,
         test_block_message_is_explicit,
     ]
     for fn in tests:

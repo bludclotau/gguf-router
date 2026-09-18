@@ -4,17 +4,14 @@ Ready for review. Do not merge until you're happy with the remaining nits.
 
 ## Done
 
-- **GBNF planner**: llama.cpp grammar forces `{"tool", "args"}` or `{"reply"}`. Tool-only grammar until the first action when the user named a URL; reply-only grammar once we have the page text we need. Persona prose is kept out of the planner prompt so it cannot fight the JSON.
-- **Multi-step chains**: verified `goto → read` (heading) and `goto → click → read` (Learn more landed on IANA “Example Domains”).
-- **Every persona** has its own browser context, session, events, memories.
-- **Auto-login**: `credentials` rows (JSON in `encrypted_key`; LAN-only, no extra crypto). `browser_login` fills selectors; secrets never enter the model prompt. Login-wall in the loop tries `browser_login` once. Fixture: `http://127.0.0.1:9000/debug/login` (wendy / snacktime) → `/debug/secret`.
-- Blocked pages still return a human `message`; Discord ack-then-edit.
-- Unit tests: `python3 router/tests/test_hardening.py`
+- **GBNF planner** and multi-step browse (goto/read/click) as before.
+- **Credential encryption at rest**: Fernet (`enc:v1:…`) via `CREDENTIALS_KEY` or `data/credentials.key` (gitignored, 0600). Legacy plaintext JSON rows are migrated on startup. Decrypt only inside `get_credential` → `browser_login`. Events/sessions/memories never store usernames or passwords. `list_credential_sites` returns hostnames only.
+- **Discord client in this repo**: `clients/discord/dolphin.js` is the router contract (ack-then-edit, blocked replies, `agent: true`). Live bots still run from **`bludclotau/llm-multibot-cluster`** (`~/vibe-hub/discord-bots`, branch `dev`) — keep `shared/dolphin.js` there in sync with this copy.
+- Durable memories are injected into the planner prompt. Recall questions use reply-only grammar so the model answers from `memories` instead of browsing.
 
-## Still rough (ok to land later)
+## Still later
 
-- Screenshots.
-- Multiple uvicorn workers / multiple Chromium processes.
-- Reply text can slightly paraphrase (`waffle-42` vs `waffle-iron-42`) — GBNF reply is a short string, not a quote engine.
-- Discord bot patches live in `~/vibe-hub/discord-bots`, not this git repo.
-- `encrypted_key` is JSON plaintext unless we add CREDENTIALS_KEY later.
+- Screenshots
+- Multi-worker Chromium
+- Reply-string paraphrasing under GBNF
+- Optional `CREDENTIALS_KEY` rotation / pgcrypto
