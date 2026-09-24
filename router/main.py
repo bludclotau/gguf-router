@@ -1,7 +1,9 @@
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
+import chat_dispatch
 import json
 import yaml
 import requests
@@ -167,6 +169,10 @@ def route(payload: RouteRequest) -> Any:
     if db.check_cooldown(user_id):
         return {"clean": "Cooldown active.", "raw": None}
 
+    triggered = chat_dispatch.first_http_url(prompt) if not payload.tool else None
+    if triggered:
+        return _dispatch_wendy(payload, user_id, bot_name, persona, triggered)
+
     tool_name = payload.tool
     tool_result = None
     if tool_name:
@@ -262,3 +268,50 @@ def route(payload: RouteRequest) -> Any:
         "user_id": user_id,
         "bot_name": bot_name,
     }
+
+
+def _dispatch_wendy(payload: RouteRequest, user_id: str, bot_name: str, persona: Optional[str], url: str) -> dict:
+    job_id = chat_dispatch.start_job(user_id, url, payload.prompt)
+    db.async_write(db.update_conversation, user_id, bot_name, persona, "wendy", chat_dispatch.ACK)
+    db.set_cooldown(user_id, COOLDOWN_SECONDS)
+
+    def worker() -> None:
+        text = ""
+        try:
+            outcome = requests.post(
+                os.environ.get("WENDY_PIPELINE_URL", "http://127.0.0.1:8790/pipeline"),
+                json={"prompt": payload.prompt, "url": url, "user_id": user_id, "persona": persona or "wendy"},
+                headers={"Authorization": f"Bearer {os.environ.get('TOOL_API_TOKEN', '')}"},
+                timeout=180,
+            )
+            outcome.raise_for_status()
+            body = outcome.json()
+            text = chat_dispatch.followup_text(url, body)
+            chat_dispatch.finish_job(job_id, text, body)
+        except Exception as exc:
+            text = f"I couldn't finish looking at that. {exc}"
+            chat_dispatch.fail_job(job_id, str(exc))
+        db.async_write(db.update_conversation, user_id, bot_name, persona, "wendy-followup", text)
+
+    chat_dispatch.launch(job_id, worker)
+    return {
+        "clean": chat_dispatch.ACK,
+        "raw": chat_dispatch.ACK,
+        "content": chat_dispatch.ACK,
+        "reply": chat_dispatch.ACK,
+        "dispatched": True,
+        "phase": "ack",
+        "job_id": job_id,
+        "url": url,
+        "persona": persona,
+        "user_id": user_id,
+        "bot_name": bot_name,
+    }
+
+
+@app.get("/route/jobs/{job_id}")
+def route_job(job_id: str) -> Any:
+    job = chat_dispatch.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="unknown job")
+    return job
