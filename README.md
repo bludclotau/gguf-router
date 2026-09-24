@@ -18,6 +18,8 @@ Bot endpoint: `http://localhost:9000/route`.
 
 Tool harness: `POST /tool` with `{"tool":"web_fetch","args":{"url":"https://example.com"},"user_id":"...","bot_name":"..."}`. Discord: `@bot !web <url>`.
 
+A plain chat prompt that contains an `http` or `https` URL does not wait on a completion. `/route` returns `let me take a look, one sec` immediately (`dispatched: true`, `job_id`) and posts the URL to Wendy at `WENDY_PIPELINE_URL` (default `http://127.0.0.1:8790/pipeline`). Poll `GET /route/jobs/{job_id}` for the follow-up. Prompts with no URL, and requests that already name a `tool`, stay on the paths below. This is separate from `"agent": true`, which still uses the in-process GBNF planner.
+
 ### Bounded agents (browser + memory)
 
 This is a chat-scoped agent, not an open-ended crawler: **6 tool steps** and **60s wall clock** per `/route` with `"agent": true`. The planner is a **GBNF-constrained** llama.cpp call (`grammar/tool_call.gbnf`) so Dolphin/Qwen emit valid `{"tool":...}` or `{"reply":...}` instead of hoping they format JSON. A URL in the prompt forces a tool-only grammar on the first step; after a successful read, a reply-only grammar stops tool-churn. Login walls call `browser_login` using the `credentials` table (secrets never enter the prompt). Fixture: `http://127.0.0.1:9000/debug/login` (wendy / snacktime).
