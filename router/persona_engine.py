@@ -43,10 +43,14 @@ def apply(persona, task, user_prompt, user_id, tool=None, tool_result=None):
     if tool:
         pre += "\nAssistant, you have access to tools. Use them when needed.\n"
 
-    # Persona memory
+    # Persona memory (last chat line) plus durable notes from memories table
     memory = db.get_persona_memory(user_id, persona)
     if memory:
         pre += f"\nYour previous interaction memory: {memory}\n"
+    if persona:
+        durable = db.get_memories(persona, limit=3)
+        if durable:
+            pre += "\nDurable notes:\n" + "\n".join(f"- {n}" for n in durable) + "\n"
 
     # Task-specific modifier
     if task:

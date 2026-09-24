@@ -1,0 +1,10 @@
+root ::= "{" ws kind ws "}"
+kind ::= tool-kind | reply-kind
+tool-kind ::= "\"tool\"" ws ":" ws tname ws "," ws "\"args\"" ws ":" ws args
+reply-kind ::= "\"reply\"" ws ":" ws string
+tname ::= "\"browser_goto\"" | "\"browser_read\"" | "\"browser_click\"" | "\"browser_type\"" | "\"browser_submit\"" | "\"browser_login\"" | "\"web_fetch\""
+args ::= "{" ws (pair (ws "," ws pair)*)? ws "}"
+pair ::= key ws ":" ws string
+key ::= "\"url\"" | "\"selector\"" | "\"text\"" | "\"site\""
+string ::= "\"" [^"\n]* "\""
+ws ::= [ \t\n]*
